@@ -3,12 +3,14 @@ package repository
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
 	"sync"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zstd"
 	"github.com/restic/chunker"
 	"github.com/restic/restic/internal/backend"
@@ -379,9 +381,11 @@ func (r *Repository) getZstdDecoder() *zstd.Decoder {
 
 // saveAndEncrypt encrypts data and stores it to the backend as type t. If data
 // is small enough, it will be packed together with other small blobs. The
-// caller must ensure that the id matches the data. Returned is the size data
-// occupies in the repo (compressed or not, including the encryption overhead).
-func (r *Repository) saveAndEncrypt(ctx context.Context, t restic.BlobType, data []byte, id restic.ID) (size int, err error) {
+// caller must ensure that the id matches the data. If checksum is set, it must
+// be the XXH64 checksum of data computed together with id. Returned is the size
+// data occupies in the repo (compressed or not, including the encryption
+// overhead).
+func (r *Repository) saveAndEncrypt(ctx context.Context, t restic.BlobType, data []byte, id restic.ID, checksum *uint64) (size int, err error) {
 	debug.Log("save id %v (%v, %d bytes)", id, t, len(data))
 
 	uncompressedLength := 0
@@ -406,7 +410,7 @@ func (r *Repository) saveAndEncrypt(ctx context.Context, t restic.BlobType, data
 	// encrypt blob
 	ciphertext = r.key.Seal(ciphertext, nonce, data, nil)
 
-	if err := r.verifyCiphertext(ciphertext, uncompressedLength, id); err != nil {
+	if err := r.verifyCiphertext(ciphertext, uncompressedLength, id, checksum); err != nil {
 		//nolint:revive,staticcheck // ignore linter warnings about error message spelling
 		return 0, fmt.Errorf("Detected data corruption while saving blob %v: %w\nCorrupted blobs are either caused by hardware issues or software bugs. Please open an issue at https://github.com/restic/restic/issues/new/choose for further troubleshooting.", id, err)
 	}
@@ -426,7 +430,10 @@ func (r *Repository) saveAndEncrypt(ctx context.Context, t restic.BlobType, data
 	return pm.SaveBlob(ctx, t, id, ciphertext, uncompressedLength)
 }
 
-func (r *Repository) verifyCiphertext(buf []byte, uncompressedLength int, id restic.ID) error {
+// verifyCiphertext decrypts and decompresses buf and checks the result against
+// the original data. If checksum is set, the plaintext is compared against it,
+// otherwise its SHA-256 hash is compared against id.
+func (r *Repository) verifyCiphertext(buf []byte, uncompressedLength int, id restic.ID, checksum *uint64) error {
 	if r.opts.NoExtraVerify {
 		return nil
 	}
@@ -444,11 +451,36 @@ func (r *Repository) verifyCiphertext(buf []byte, uncompressedLength int, id res
 			return fmt.Errorf("decompression failed: %w", err)
 		}
 	}
+	if checksum != nil {
+		if xxhash.Sum64(plaintext) != *checksum {
+			return errors.New("checksum mismatch")
+		}
+		return nil
+	}
 	if !restic.Hash(plaintext).Equal(id) {
 		return errors.New("hash mismatch")
 	}
 
 	return nil
+}
+
+// hashWithChecksum returns the SHA-256 blob ID and the XXH64 checksum of buf.
+// verifyCiphertext uses the checksum instead of hashing the data a second time
+// with SHA-256. Each block is fed to both hashes back to back while it is in
+// cache, so both see the same bytes.
+func hashWithChecksum(buf []byte) (restic.ID, uint64) {
+	const blockSize = 64 * 1024
+	sh := sha256.New()
+	xh := xxhash.New()
+	for len(buf) > 0 {
+		n := min(len(buf), blockSize)
+		_, _ = sh.Write(buf[:n])
+		_, _ = xh.Write(buf[:n])
+		buf = buf[n:]
+	}
+	var id restic.ID
+	sh.Sum(id[:0])
+	return id, xh.Sum64()
 }
 
 func (r *Repository) compressUnpacked(p []byte) ([]byte, error) {
@@ -1024,6 +1056,9 @@ func (r *Repository) saveBlob(ctx context.Context, t restic.BlobType, buf []byte
 		return restic.ID{}, false, 0, fmt.Errorf("blob is larger than 4GB")
 	}
 
+	// checksum is only set if the blob ID was computed here
+	var checksum *uint64
+
 	// compute plaintext hash if not already set
 	if id.IsNull() {
 		// Special case the hash calculation for all zero chunks. This is especially
@@ -1032,7 +1067,9 @@ func (r *Repository) saveBlob(ctx context.Context, t restic.BlobType, buf []byte
 		if len(buf) == chunker.MinSize && restic.ZeroPrefixLen(buf) == chunker.MinSize {
 			newID = r.zeroChunk()
 		} else {
-			newID = restic.Hash(buf)
+			var sum uint64
+			newID, sum = hashWithChecksum(buf)
+			checksum = &sum
 		}
 	} else {
 		newID = id
@@ -1043,7 +1080,7 @@ func (r *Repository) saveBlob(ctx context.Context, t restic.BlobType, buf []byte
 
 	// only save when needed or explicitly told
 	if !known || storeDuplicate {
-		size, err = r.saveAndEncrypt(ctx, t, buf, newID)
+		size, err = r.saveAndEncrypt(ctx, t, buf, newID, checksum)
 	}
 
 	return newID, known, size, err

@@ -438,13 +438,98 @@ func TestBlobVerification(t *testing.T) {
 			ciphertext[42] ^= 0x42
 		}
 
-		err := repo.verifyCiphertext(ciphertext, int(uncompressedLength), id)
+		err := repo.verifyCiphertext(ciphertext, int(uncompressedLength), id, nil)
 		if test.msg == "" {
 			rtest.Assert(t, err == nil, "expected no error, got %v", err)
 		} else {
 			rtest.Assert(t, strings.Contains(err.Error(), test.msg), "expected error to contain %q, got %q", test.msg, err)
 		}
 	}
+}
+
+func TestHashWithChecksum(t *testing.T) {
+	for _, size := range []int{0, 1, 64*1024 - 1, 64 * 1024, 64*1024 + 1, 3 << 20} {
+		data := rtest.Random(size, size)
+		id, _ := hashWithChecksum(data)
+		rtest.Equals(t, restic.Hash(data), id)
+	}
+}
+
+func TestBlobVerificationChecksum(t *testing.T) {
+	repo := TestRepository(t)
+
+	type DamageType string
+	const (
+		damageData       DamageType = "data"
+		damageCompressed DamageType = "compressed"
+		damageCiphertext DamageType = "ciphertext"
+	)
+
+	for _, test := range []struct {
+		damage DamageType
+		msg    string
+	}{
+		{"", ""},
+		// source buffer corrupted after the blob ID and checksum were computed
+		{damageData, "checksum mismatch"},
+		{damageCompressed, "decompression failed"},
+		{damageCiphertext, "ciphertext verification failed"},
+	} {
+		plaintext := rtest.Random(800, 1234)
+		id, sum := hashWithChecksum(plaintext)
+		if test.damage == damageData {
+			plaintext[42] ^= 0x42
+		}
+
+		uncompressedLength := len(plaintext)
+		plaintext = repo.getZstdEncoder().EncodeAll(plaintext, nil)
+		if test.damage == damageCompressed {
+			plaintext = plaintext[:len(plaintext)-8]
+		}
+
+		nonce := crypto.NewRandomNonce()
+		ciphertext := append([]byte{}, nonce...)
+		ciphertext = repo.Key().Seal(ciphertext, nonce, plaintext, nil)
+		if test.damage == damageCiphertext {
+			ciphertext[42] ^= 0x42
+		}
+
+		err := repo.verifyCiphertext(ciphertext, uncompressedLength, id, &sum)
+		if test.msg == "" {
+			rtest.Assert(t, err == nil, "expected no error, got %v", err)
+		} else {
+			rtest.Assert(t, err != nil && strings.Contains(err.Error(), test.msg), "expected error to contain %q, got %v", test.msg, err)
+		}
+	}
+}
+
+// BenchmarkHashAndVerify compares computing the blob ID plus verifying the
+// encrypted blob with a second SHA-256 pass against using the XXH64 checksum.
+func BenchmarkHashAndVerify(b *testing.B) {
+	repo := TestRepository(b)
+	plaintext := rtest.Random(23, 4<<20)
+	for i := range plaintext {
+		// compressible data
+		plaintext[i] = 'a' + plaintext[i]%16
+	}
+	compressed := repo.getZstdEncoder().EncodeAll(plaintext, nil)
+	nonce := crypto.NewRandomNonce()
+	ciphertext := repo.Key().Seal(append([]byte{}, nonce...), nonce, compressed, nil)
+
+	b.Run("sha256", func(b *testing.B) {
+		b.SetBytes(int64(len(plaintext)))
+		for b.Loop() {
+			id := restic.Hash(plaintext)
+			rtest.OK(b, repo.verifyCiphertext(ciphertext, len(plaintext), id, nil))
+		}
+	})
+	b.Run("xxh64", func(b *testing.B) {
+		b.SetBytes(int64(len(plaintext)))
+		for b.Loop() {
+			id, sum := hashWithChecksum(plaintext)
+			rtest.OK(b, repo.verifyCiphertext(ciphertext, len(plaintext), id, &sum))
+		}
+	})
 }
 
 func TestUnpackedVerification(t *testing.T) {

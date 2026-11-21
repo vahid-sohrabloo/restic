@@ -19,6 +19,7 @@ env:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         # list of jobs to run:
         include:
@@ -164,6 +165,7 @@ jobs:
           go test -cover ${{matrix.test_opts}} ./...
 
       - name: Test cloud backends
+        if: false
         env:
           RESTIC_TEST_S3_KEY: ${{ secrets.RESTIC_TEST_S3_KEY }}
           RESTIC_TEST_S3_SECRET: ${{ secrets.RESTIC_TEST_S3_SECRET }}

@@ -165,7 +165,6 @@ jobs:
           go test -cover ${{matrix.test_opts}} ./...
 
       - name: Test cloud backends
-        if: ${{ false }}
         env:
           RESTIC_TEST_S3_KEY: ${{ secrets.RESTIC_TEST_S3_KEY }}
           RESTIC_TEST_S3_SECRET: ${{ secrets.RESTIC_TEST_S3_SECRET }}
@@ -204,7 +203,7 @@ jobs:
         # own repo, otherwise the secrets are not available
         # Skip for Dependabot pull requests as these are run without secrets
         # https://docs.github.com/en/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions#responding-to-events
-        if: ((github.repository == 'restic/restic' && github.event_name == 'push') || github.event.pull_request.head.repo.full_name == github.repository) && (github.actor != 'dependabot[bot]') && matrix.test_cloud_backends
+        if: ((github.repository == 'restic/restic' && github.event_name == 'push') || github.event.pull_request.head.repo.full_name == github.repository) && (github.actor != 'dependabot[bot]') && matrix.test_cloud_backends && false
 
       - name: Check changelog files with calens
         run: |

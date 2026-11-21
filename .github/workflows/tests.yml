@@ -165,7 +165,7 @@ jobs:
           go test -cover ${{matrix.test_opts}} ./...
 
       - name: Test cloud backends
-        if: false
+        if: ${{ false }}
         env:
           RESTIC_TEST_S3_KEY: ${{ secrets.RESTIC_TEST_S3_KEY }}
           RESTIC_TEST_S3_SECRET: ${{ secrets.RESTIC_TEST_S3_SECRET }}
